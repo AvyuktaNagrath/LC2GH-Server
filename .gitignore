@@ -1,0 +1,19 @@
+node_modules
+.env
+data/*
+!data/.gitkeep
+keys/*
+
+# Node
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Keys / Certs
+*.pem
+*.key
+*.crt
+*.cert
