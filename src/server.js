@@ -5,6 +5,9 @@ import jwt from "jsonwebtoken";
 import { nanoid } from "nanoid";
 import { appOcto, instOcto } from "./lib/octo.js";
 import { signJWT, newRefresh, verifyRefresh } from "./lib/tokens.js";
+import crypto from "node:crypto";
+import { extFor } from "./lib/ext.js";
+import { upsertFile } from "./lib/commit.js";
 
 
 const db = new Database("data/app.sqlite");
@@ -31,11 +34,14 @@ await app.register(cors, {
     if (!origin) return cb(null, true);
     if (origin.startsWith("chrome-extension://")) return cb(null, true);
     if (origin.startsWith("http://localhost")) return cb(null, true);
+    if (origin.startsWith("https://leetcode.com")) return cb(null, true);
+    if (origin.startsWith("https://leetcode.cn")) return cb(null, true);
     cb(new Error("Not allowed"), false);
   },
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"]
 });
+
 
 const now = () => Date.now();
 
@@ -100,10 +106,14 @@ app.get("/auth/github/callback", async (req, reply) => {
     "ON CONFLICT(id) DO UPDATE SET login=excluded.login, avatar_url=excluded.avatar_url"
   ).run(userId, login, avatar, now());
 
+  // Ensure only ONE installation per user
+  db.prepare("DELETE FROM installations WHERE user_id=?").run(userId);
+
   db.prepare(
     "INSERT INTO installations (installation_id, user_id, target_type, created_at) VALUES (?, ?, 'User', ?) " +
     "ON CONFLICT(installation_id) DO NOTHING"
   ).run(inst.id, userId, now());
+
 
   const io = instOcto(inst.id);
   const repos = await io.paginate(io.apps.listReposAccessibleToInstallation, { per_page: 100 });
@@ -162,7 +172,13 @@ app.post("/auth/refresh", async (req, reply) => {
   db.prepare("INSERT INTO refresh_tokens (id, user_id, ext_instance_id, hashed_token, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(newId, row.user_id, ext_instance_id || row.ext_instance_id, newHash, now());
 
-  const inst = db.prepare("SELECT installation_id FROM installations WHERE user_id=?").get(row.user_id);
+  const inst = db.prepare(`
+    SELECT installation_id
+    FROM installations
+    WHERE user_id=?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(row.user_id);
   const st = db.prepare("SELECT default_repo_id FROM settings WHERE user_id=?").get(row.user_id);
   const { token: access, exp } = signJWT({ sub: row.user_id, inst: inst.installation_id, repo_id: st.default_repo_id, scopes: ["submit"] }, 45);
 
@@ -200,21 +216,148 @@ app.put("/v1/settings", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
-// Submissions stub (idempotency header enforced; commit worker later)
+// Submissions: commit to repo (idempotent via code_sha soft-dedupe)
 app.post("/v1/submissions", async (req, reply) => {
   const c = requireAuth(req);
+  if (!Array.isArray(c.scopes) || !c.scopes.includes("submit")) {
+    return reply.code(403).send({ error: "forbidden", message: "missing submit scope" });
+  }
+
   const idem = req.headers["idempotency-key"];
   if (!idem) return reply.code(400).send({ error: "Idempotency-Key required" });
 
-  const { slug, title, language, code, url, timestamp } = req.body || {};
+  const { slug, title, language, code, url, timestamp, difficulty, tags } = req.body || {};
   if (!slug || !code) return reply.code(400).send({ error: "missing slug/code" });
   if (code.length > 200_000) return reply.code(413).send({ error: "code too large" });
 
-  // TODO: enqueue commit job; for now accept
-  return reply.code(202).send({ status: "queued" });
+  const codeSha = crypto.createHash("sha256").update(code, "utf8").digest("hex");
+  const existing = db
+    .prepare("SELECT id FROM submissions WHERE user_id=? AND code_sha=? LIMIT 1")
+    .get(c.sub, codeSha);
+  if (existing) {
+    return reply.code(200).send({ status: "duplicate", submission_id: existing.id });
+  }
+
+  const st = db.prepare("SELECT default_repo_id, path_template FROM settings WHERE user_id=?").get(c.sub);
+  if (!st) return reply.code(400).send({ error: "no settings", message: "no default repo configured" });
+
+  let repoRow = db.prepare("SELECT full_name, installation_id FROM repos WHERE id=?").get(st.default_repo_id);
+  if (!repoRow) return reply.code(400).send({ error: "repo not found for default_repo_id" });
+
+  // Lazy resync if mismatch
+  if (repoRow.installation_id !== c.inst) {
+    const ioSync = instOcto(c.inst);
+    const fresh = await ioSync.paginate(ioSync.apps.listReposAccessibleToInstallation, { per_page: 100 });
+
+    const up = db.prepare(
+      "INSERT INTO repos (id, installation_id, full_name, private) VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(id) DO UPDATE SET installation_id=excluded.installation_id, full_name=excluded.full_name, private=excluded.private"
+    );
+    for (const r of fresh) up.run(r.id, c.inst, r.full_name, r.private ? 1 : 0);
+
+    repoRow = db.prepare("SELECT full_name, installation_id FROM repos WHERE id=?").get(st.default_repo_id);
+    if (!repoRow) return reply.code(400).send({ error: "repo not found after sync" });
+  }
+
+  if (repoRow.installation_id !== c.inst) {
+    return reply.code(403).send({ error: "repo not accessible by installation" });
+  }
+
+  const [owner, repo] = String(repoRow.full_name).split("/");
+  if (!owner || !repo) return reply.code(500).send({ error: "bad repo full_name" });
+
+  const tpl = st.path_template || "problems/{primary}/{slug}";
+  const tsIso = typeof timestamp === "string" && timestamp ? timestamp : new Date().toISOString();
+  const dateStr = tsIso.slice(0, 10);
+  const tsCompact = tsIso.replace(/[-:TZ.]/g, "").slice(0, 15);
+  const primary = (difficulty || "").toLowerCase() || "unknown";
+  const langExt = extFor(language || "");
+  const fill = (s) =>
+    s.replaceAll("{slug}", slug)
+      .replaceAll("{primary}", primary)
+      .replaceAll("{date}", dateStr)
+      .replaceAll("{ts}", tsCompact)
+      .replaceAll("{lang_ext}", langExt);
+
+  let relPath = fill(tpl);
+  const last = relPath.split("/").pop() || "";
+  if (!last.includes(".")) {
+    if (relPath && !relPath.endsWith("/")) relPath += "/";
+    relPath += `solution.${langExt || "txt"}`;
+  }
+
+  try {
+    const io = instOcto(c.inst);
+    const message = `feat(lc): ${slug} — ${title || slug}${language ? ` [${language}]` : ""}`;
+    const commitSha = await upsertFile(io, owner, repo, relPath, code, message);
+
+    // 👉 also write a README.md alongside the solution
+    const readmePath = relPath.replace(/[^/]+$/, "README.md");
+    const readmeContent = `# ${title || slug}
+
+    - **Slug:** ${slug}
+    - **Difficulty:** ${difficulty || "—"}
+    - **Language:** ${language || "—"}
+    - **Source:** ${url || ""}
+    - **Captured:** ${tsIso}
+
+    ## Code
+
+    \`\`\`${language || ""}
+    ${code.slice(0, 2000)} 
+    \`\`\`
+    `;
+
+    await upsertFile(io, owner, repo, readmePath, readmeContent, message);
+    
+
+    const submissionId = nanoid();
+    db.prepare(
+      `INSERT INTO submissions
+       (id, user_id, slug, language, url, ts, code_sha, size, difficulty, tags_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      submissionId,
+      c.sub,
+      slug,
+      language || null,
+      url || null,
+      tsIso,
+      codeSha,
+      code.length,
+      difficulty || null,
+      tags ? JSON.stringify(tags) : null,
+      now()
+    );
+
+    return reply.code(201).send({
+      status: "committed",
+      repo: repoRow.full_name,
+      path: relPath,
+      commit_sha: commitSha,
+      submission_id: submissionId
+    });
+  } catch (e) {
+    req.log.error({ err: e }, "commit failed");
+    const msg = e?.message || "commit failed";
+    const status = e?.status;
+    if (status === 403) return reply.code(403).send({ error: "forbidden", message: msg });
+    if (status === 404) return reply.code(404).send({ error: "not_found", message: msg });
+    return reply.code(502).send({ error: "github_error", message: msg });
+  }
 });
 
+
+
 const port = Number(process.env.PORT || 8787);
+
+try {
+  const oct = appOcto();
+  const { data: appInfo } = await oct.request("GET /app");
+  app.log.info({ appId: appInfo.id, slug: appInfo.slug, name: appInfo.name }, "GitHub App credentials loaded");
+} catch (e) {
+  app.log.error({ err: e }, "Failed to identify GitHub App");
+}
 
 try {
   await app.listen({ port, host: "0.0.0.0" });
