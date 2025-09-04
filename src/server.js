@@ -45,6 +45,33 @@ await app.register(cors, {
 
 const now = () => Date.now();
 
+function fillTemplate(tpl, { slug, primary, dateStr, tsCompact, langExt }) {
+  return (tpl || "problems/{primary}/{slug}")
+    .replaceAll("{slug}", slug)
+    .replaceAll("{primary}", primary)
+    .replaceAll("{date}", dateStr)
+    .replaceAll("{ts}", tsCompact)
+    .replaceAll("{lang_ext}", langExt);
+}
+
+function ensureFilePath(relPath, langExt) {
+  const last = relPath.split("/").pop() || "";
+  if (!last.includes(".")) {
+    if (relPath && !relPath.endsWith("/")) relPath += "/";
+    relPath += `solution.${langExt || "txt"}`;
+  }
+  return relPath;
+}
+
+function mkLinks(owner, repo, branch, relPath) {
+  const cleanBranch = branch || "main";
+  const html_file = `https://github.com/${owner}/${repo}/blob/${cleanBranch}/${relPath}`;
+  const dir = relPath.includes("/") ? relPath.slice(0, relPath.lastIndexOf("/")) : "";
+  const html_dir = `https://github.com/${owner}/${repo}/tree/${cleanBranch}/${dir}`;
+  return { html_file, html_dir, branch: cleanBranch };
+}
+
+
 // Start: ONLY for extension. Requires nonce + redirect, persists redirect for callback.
 app.get("/auth/github/start", async (req, reply) => {
   const { client = "ext", redirect = "", nonce = "" } = req.query;
@@ -107,7 +134,6 @@ app.get("/auth/github/callback", async (req, reply) => {
   ).run(userId, login, avatar, now());
 
   // Ensure only ONE installation per user
-  db.prepare("DELETE FROM installations WHERE user_id=?").run(userId);
 
   db.prepare(
     "INSERT INTO installations (installation_id, user_id, target_type, created_at) VALUES (?, ?, 'User', ?) " +
@@ -216,6 +242,78 @@ app.put("/v1/settings", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
+// Status: check if any submission exists for a slug (latest row)
+app.get("/v1/submissions/status", async (req, reply) => {
+  const c = requireAuth(req);
+  const { slug } = req.query || {};
+  if (!slug) return reply.code(400).send({ error: "missing slug" });
+
+  const st = db.prepare("SELECT default_repo_id, path_template FROM settings WHERE user_id=?").get(c.sub);
+  if (!st) return reply.code(400).send({ error: "no settings" });
+
+  const repoRow = db.prepare("SELECT full_name, installation_id FROM repos WHERE id=?").get(st.default_repo_id);
+  if (!repoRow) return reply.code(400).send({ error: "repo not found for default_repo_id" });
+  if (repoRow.installation_id !== c.inst) {
+    // Token is for a different (likely older) installation; don’t hit GitHub
+    return reply.code(403).send({ error: "repo not accessible by installation" });
+  }
+
+  const [owner, repo] = String(repoRow.full_name).split("/");
+  if (!owner || !repo) return reply.code(500).send({ error: "bad repo full_name" });
+
+  const row = db.prepare(`
+    SELECT id, slug, language, difficulty, ts
+    FROM submissions
+    WHERE user_id=? AND slug=?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(c.sub, String(slug));
+
+  // If no submission exists, return early — no GitHub call needed
+  if (!row) {
+    return reply.send({ exists: false, repo: repoRow.full_name });
+  }
+
+  // Build path from stored row (accurate even with {date}/{ts})
+  const langExt = extFor(row.language || "");
+  const tsIso = row.ts || new Date().toISOString();
+  const dateStr = tsIso.slice(0, 10);
+  const tsCompact = tsIso.replace(/[-:TZ.]/g, "").slice(0, 15);
+  const primary = (row.difficulty || "").toLowerCase() || "unknown";
+
+  let relPath = fillTemplate(st.path_template, {
+    slug: row.slug,
+    primary,
+    dateStr,
+    tsCompact,
+    langExt
+  });
+  relPath = ensureFilePath(relPath, langExt);
+
+  // Try to read default branch; if it fails (stale/invalid installation), default to "main"
+  let defaultBranch = "main";
+  try {
+    const io = instOcto(c.inst);
+    const { data: info } = await io.repos.get({ owner, repo });
+    defaultBranch = info.default_branch || "main";
+  } catch (err) {
+    req.log.warn({ err }, "status: defaulting to main for branch");
+  }
+
+  const { html_file, html_dir } = mkLinks(owner, repo, defaultBranch, relPath);
+  return reply.send({
+    exists: true,
+    submission_id: row.id,
+    repo: repoRow.full_name,
+    path: relPath,
+    html_file,
+    html_dir
+  });
+});
+
+
+
+
 // Submissions: commit to repo (idempotent via code_sha soft-dedupe)
 app.post("/v1/submissions", async (req, reply) => {
   const c = requireAuth(req);
@@ -231,13 +329,8 @@ app.post("/v1/submissions", async (req, reply) => {
   if (code.length > 200_000) return reply.code(413).send({ error: "code too large" });
 
   const codeSha = crypto.createHash("sha256").update(code, "utf8").digest("hex");
-  const existing = db
-    .prepare("SELECT id FROM submissions WHERE user_id=? AND code_sha=? LIMIT 1")
-    .get(c.sub, codeSha);
-  if (existing) {
-    return reply.code(200).send({ status: "duplicate", submission_id: existing.id });
-  }
 
+  // ---- resolve settings + repo BEFORE duplicate check (we need path + links either way)
   const st = db.prepare("SELECT default_repo_id, path_template FROM settings WHERE user_id=?").get(c.sub);
   if (!st) return reply.code(400).send({ error: "no settings", message: "no default repo configured" });
 
@@ -266,50 +359,75 @@ app.post("/v1/submissions", async (req, reply) => {
   const [owner, repo] = String(repoRow.full_name).split("/");
   if (!owner || !repo) return reply.code(500).send({ error: "bad repo full_name" });
 
-  const tpl = st.path_template || "problems/{primary}/{slug}";
+  const io = instOcto(c.inst);
+  // Always know the default branch so links are correct.
+  const { data: info } = await io.repos.get({ owner, repo });
+  const defaultBranch = info.default_branch || "main";
+
+  // ---- duplicate check (need the full row, not just id)
+  const existing = db
+    .prepare("SELECT * FROM submissions WHERE user_id=? AND code_sha=? LIMIT 1")
+    .get(c.sub, codeSha);
+
+  if (existing) {
+    const langExt = extFor(existing.language || "");
+    const tsIso = existing.ts || new Date().toISOString();
+    const dateStr = tsIso.slice(0, 10);
+    const tsCompact = tsIso.replace(/[-:TZ.]/g, "").slice(0, 15);
+    const primary = (existing.difficulty || "").toLowerCase() || "unknown";
+
+    let relPath = fillTemplate(st.path_template, {
+      slug: existing.slug || slug,
+      primary,
+      dateStr,
+      tsCompact,
+      langExt
+    });
+    relPath = ensureFilePath(relPath, langExt);
+
+    const { html_file, html_dir } = mkLinks(owner, repo, defaultBranch, relPath);
+
+    return reply.code(200).send({
+      status: "duplicate",
+      repo: repoRow.full_name,
+      path: relPath,
+      html_file,
+      html_dir,
+      submission_id: existing.id
+    });
+  }
+
+  // ---- build path for new commit
   const tsIso = typeof timestamp === "string" && timestamp ? timestamp : new Date().toISOString();
   const dateStr = tsIso.slice(0, 10);
   const tsCompact = tsIso.replace(/[-:TZ.]/g, "").slice(0, 15);
   const primary = (difficulty || "").toLowerCase() || "unknown";
   const langExt = extFor(language || "");
-  const fill = (s) =>
-    s.replaceAll("{slug}", slug)
-      .replaceAll("{primary}", primary)
-      .replaceAll("{date}", dateStr)
-      .replaceAll("{ts}", tsCompact)
-      .replaceAll("{lang_ext}", langExt);
 
-  let relPath = fill(tpl);
-  const last = relPath.split("/").pop() || "";
-  if (!last.includes(".")) {
-    if (relPath && !relPath.endsWith("/")) relPath += "/";
-    relPath += `solution.${langExt || "txt"}`;
-  }
+  let relPath = fillTemplate(st.path_template, {
+    slug,
+    primary,
+    dateStr,
+    tsCompact,
+    langExt
+  });
+  relPath = ensureFilePath(relPath, langExt);
 
   try {
-    const io = instOcto(c.inst);
     const message = `feat(lc): ${slug} — ${title || slug}${language ? ` [${language}]` : ""}`;
     const commitSha = await upsertFile(io, owner, repo, relPath, code, message);
 
-    // 👉 also write a README.md alongside the solution
+    // README sidecar (best-effort)
     const readmePath = relPath.replace(/[^/]+$/, "README.md");
     const readmeContent = `# ${title || slug}
 
-    - **Slug:** ${slug}
-    - **Difficulty:** ${difficulty || "—"}
-    - **Language:** ${language || "—"}
-    - **Source:** ${url || ""}
-    - **Captured:** ${tsIso}
-
-    ## Code
-
-    \`\`\`${language || ""}
-    ${code.slice(0, 2000)} 
-    \`\`\`
-    `;
-
+- **Slug:** ${slug}
+- **Difficulty:** ${difficulty || "—"}
+- **Language:** ${language || "—"}
+- **Source:** ${url || ""}
+- **Captured:** ${tsIso}
+`;
     await upsertFile(io, owner, repo, readmePath, readmeContent, message);
-    
 
     const submissionId = nanoid();
     db.prepare(
@@ -330,10 +448,14 @@ app.post("/v1/submissions", async (req, reply) => {
       now()
     );
 
+    const { html_file, html_dir } = mkLinks(owner, repo, defaultBranch, relPath);
+
     return reply.code(201).send({
       status: "committed",
       repo: repoRow.full_name,
       path: relPath,
+      html_file,
+      html_dir,
       commit_sha: commitSha,
       submission_id: submissionId
     });
@@ -346,6 +468,7 @@ app.post("/v1/submissions", async (req, reply) => {
     return reply.code(502).send({ error: "github_error", message: msg });
   }
 });
+
 
 
 
